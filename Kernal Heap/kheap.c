@@ -34,6 +34,29 @@ static struct kspinlock kheap_lock;
 #define KH_PANIC(...)   do { release_kspinlock(&kheap_lock); panic(__VA_ARGS__); } while (0)
 
 /* ================= HELPERS ================= */
+// doubly-linked list of FREE areas only (values = page index + 1 , 0 = null)
+static uint32 fl_head;
+static uint32 fl_next[KH_NUM_PAGES];
+static uint32 fl_prev[KH_NUM_PAGES];
+
+static void fl_insert(uint32 idx)
+{
+	fl_prev[idx] = 0;
+	fl_next[idx] = fl_head;
+	if (fl_head)
+		fl_prev[fl_head - 1] = idx + 1;
+	fl_head = idx + 1;
+}
+
+static void fl_remove(uint32 idx)
+{
+	if (fl_prev[idx])
+		fl_next[fl_prev[idx] - 1] = fl_next[idx];
+	else
+		fl_head = fl_next[idx];
+	if (fl_next[idx])
+		fl_prev[fl_next[idx] - 1] = fl_prev[idx];
+}
 
  //clear the tags of n pages starting at page idx
 static void zero_tags(uint32 idx, uint32 n)
@@ -48,6 +71,7 @@ static void set_free_area(uint32 idx, uint32 n)
 	zero_tags(idx, n);
 	area_tag[idx] = TAG_FREE_FLAG | n;
 	area_tag[idx + n - 1] = TAG_FREE_FLAG | n;
+	fl_insert(idx);
 }
 
 // give n physical frames to n pages starting at va. 0 = success, -1 = failure
@@ -102,13 +126,17 @@ static void release_area(uint32 idx, uint32 n)
 
 	/* merge with the next area */
 	if (idx + n < end && TAG_IS_FREE(area_tag[idx + n]))
+	{
+		fl_remove(idx + n);                       /* it will be merged, so take it out of the free list */
 		total += TAG_PAGES(area_tag[idx + n]);
+	}
 
 	/* merge with the previous area (look at its last page) */
 	if (idx > 0 && TAG_IS_FREE(area_tag[idx - 1]))
 	{
 		uint32 pn = TAG_PAGES(area_tag[idx - 1]);
 		start = idx - pn;
+		fl_remove(start);                         /* it will be merged, so take it out of the free list */
 		total += pn;
 	}
 
@@ -141,33 +169,37 @@ static void *page_alloc(uint32 npages) //CUSTOM FIT
 	uint32 end = PG_IDX(kheapPageAllocBreak); // a5r page before el break
 	uint32 selected_idx  = 0, bestn = 0; //selected_idx -> bedayt el block , bestn -> size of block
 	int found = 0;
+	int exact = 0; // 1 = an exact fit was found
 	uint32 idx = 0;
-	while (idx < end)
+	uint32 link = fl_head; // walk the FREE list only (not every page up to the break) , 0 = no free areas
+	while (link)
 	{
+		idx = link - 1; // page index of the current free block
 		uint32 t = area_tag[idx]; // tag with current block (el tag by7dd el block used&unused)
 		uint32 n = TAG_PAGES(t); // no.of pages available in heap (btt8er mn block l block )
-		if (n == 0)
+		if (n == 0 || !TAG_IS_FREE(t))
 			KH_PANIC("page_alloc: corrupted tags at page %d", idx);
-		if (TAG_IS_FREE(t)) // lw el block free
+		// the free list is not sorted by address , so ties are broken by the LOWEST address
+		if (n == npages) //exact ?
 		{
-			if (n == npages) //exact ?
+			if (!exact || idx < selected_idx) // keep the lowest exact area
 			{
-				uint32 selected_idx  = idx;
-				bestn = n; found = 1;
-				break; // exit from loop because we allocate exact area
-			}
-			if (n > npages && (!found || n > bestn)) // npages -> no of pages el kernel 3ayz y7gzha =required pages (thapta)
-			{
-				selected_idx  = idx; bestn = n; found = 1;
+				selected_idx  = idx;
+				bestn = n; found = 1; exact = 1;
 			}
 		}
-		idx += n; // next block
+		else if (!exact && n > npages && (!found || n > bestn || (n == bestn && idx < selected_idx))) // npages -> no of pages el kernel 3ayz y7gzha =required pages (thapta)
+		{
+			selected_idx  = idx; bestn = n; found = 1;
+		}
+		link = fl_next[idx]; // next free block
 	}
 
 	if (found)
 	{
 		if (map_range(PG_VA(selected_idx ), npages) != 0)
 			return NULL;
+		fl_remove(selected_idx ); // the area is not free anymore
 		zero_tags(selected_idx , bestn);
 		area_tag[selected_idx ] = TAG_USED(npages);
 		if (bestn > npages)
@@ -242,30 +274,6 @@ void  delete_buddy_space(void *va)
 	buddy_page[PG_IDX(a)] = 0; // Mark the page as not used by the Buddy System
 	page_free(PG_IDX(a));
 }
-
-/* make sure the buddy lists contain a block big enough for "size" bytes.
- * if not, take a fresh page and add it as one big free block. (lock must be held) */
-static int ensure_buddy_block(uint32 size)
-{
-	uint32 total = size + META_DATA_SIZE;
-	int level = BUDDY_LOWER_LEVEL;
-	while (BLOCK_SIZE(level) < total)
-		level++;
-
-	for (int l = level; l <= BUDDY_UPPER_LEVEL; l++)
-		if (!LIST_EMPTY(&freeBlockLists[l]))
-			return 1;
-
-	void *p = create_buddy_space();
-	if (p == NULL)
-		return 0;
-	struct BlockMetaData *b = (struct BlockMetaData *)p;
-	b->level = BUDDY_UPPER_LEVEL;
-	b->is_free = 1;
-	LIST_INSERT_HEAD(&freeBlockLists[BUDDY_UPPER_LEVEL], b);
-	return 1;
-}
-
 /**************************************************/
 /* PAGE ALLOCATOR */
 /**************************************************/
@@ -278,8 +286,7 @@ void* kmalloc(unsigned int size)
 	acquire_kspinlock(&kheap_lock);
 	if (size <= DYN_ALLOC_MAX_BLOCK_SIZE - META_DATA_SIZE)
 	{
-		if (ensure_buddy_block(size))
-			ret = alloc_block(size);                      /* BLOCK ALLOCATOR */
+		ret = alloc_block(size);                          /* BLOCK ALLOCATOR */
 	}
 	else
 	{
@@ -372,6 +379,7 @@ static int pages_resize_inplace(uint32 idx, uint32 oldn, uint32 newn)
 		uint32 m = TAG_PAGES(t);
 		if (map_range(PG_VA(idx + oldn), extra) != 0)
 			return 0;
+		fl_remove(idx + oldn);                            /* the free area is consumed , take it out of the free list */
 		zero_tags(idx + oldn, extra);
 		area_tag[idx] = TAG_USED(newn);
 		if (m > extra)

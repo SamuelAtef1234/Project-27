@@ -129,6 +129,16 @@ void free_block(void *va)
 	}
 	bmData->level = lvl;
 	bmData->is_free = 1;
+	if (lvl == BUDDY_UPPER_LEVEL)//el block wasal l a3la level , nshof nos el page el tany
+	{
+		struct BlockMetaData *other = (struct BlockMetaData *)((uint32)bmData ^ BLOCK_SIZE(lvl));
+		if (other->is_free && other->level == lvl)//el nos el tany fady kaman (mat2smsh w mafe4 7aga m7goza fih)
+		{
+			LIST_REMOVE(&freeBlockLists[lvl], other);//4elo mn el list 3shan el page kolha htetmsa7
+			delete_buddy_space((void *)bmData);//el page kolha fadya , nrg3ha ll kernel heap
+			return;
+		}
+	}
 	LIST_INSERT_HEAD(&freeBlockLists[lvl], bmData);//5leh available tany
 }
 
@@ -144,27 +154,21 @@ void *realloc_block(void* va, uint32 newSize)
 	//TODO: [PROJECT'26.BONUS#1] KERNEL REALLOC - realloc_block
 	if (va == NULL)
 			return alloc_block(newSize);//law mafesh va a3ml 1 gded
-
 	if (newSize == 0)
 	{
 		free_block(va);
 		return NULL;
 	}
-
 	if (newSize > DYN_ALLOC_MAX_BLOCK_SIZE - META_DATA_SIZE)//law akbr mn akbr level
 		return NULL;
-
 	struct BlockMetaData *blk = (struct BlockMetaData *)((uint32)va - META_DATA_SIZE);
 	int oldLevel = blk->level;
-
 	uint32 totalSize = newSize + META_DATA_SIZE;
 	int newLevel = BUDDY_LOWER_LEVEL;
 	while (BLOCK_SIZE(newLevel) < totalSize)
 		newLevel++;
-
 	if (newLevel == oldLevel)
 		return va;
-
 	if (newLevel < oldLevel)
 	{
 		for (int l = newLevel; l < oldLevel; l++)
@@ -177,7 +181,6 @@ void *realloc_block(void* va, uint32 newSize)
 		blk->level = newLevel;
 		return va;//m7sl4 ay t8eer elsize
 	}
-
 	if (((uint32)blk & (BLOCK_SIZE(newLevel) - 1)) == 0)
 	{
 		int canExpand = 1;
@@ -190,7 +193,6 @@ void *realloc_block(void* va, uint32 newSize)
 				break;
 			}
 		}
-
 		if (canExpand)
 		{
 			for (int l = oldLevel; l < newLevel; l++)
@@ -202,7 +204,6 @@ void *realloc_block(void* va, uint32 newSize)
 			return va;
 		}
 	}
-
 	void *newVa = alloc_block(newSize);//tgeb msa7a gdeda ll address algded
 	if (newVa == NULL)
 		return NULL;
